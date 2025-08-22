@@ -1,67 +1,64 @@
 // custom-mcp-config.js
-process.on('uncaughtException', e => console.error('[MCP] uncaughtException', e));
-process.on('unhandledRejection', e => console.error('[MCP] unhandledRejection', e));
 console.log("[MCP] custom-mcp-config.js loaded");
 
 module.exports = {
   configureMcp(server, ResourceTemplate, z) {
-    const ApiSchema = z.object({
-      endpoint: z.string().describe("n8n API endpoint, e.g. /rest/workflows or /rest/executions"),
-      method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
-      query: z.record(z.any()).default({}).describe("Optional query params"),
-      payload: z.any().optional().describe("JSON body for POST/PUT/PATCH"),
-      apiKey: z.string().optional().describe("Override n8n API key if not set via env"),
-      baseUrl: z.string().optional().describe("Override base URL if not set via env")
-    });
+    // Health check
+    server.tool("ping_tool", "Health check", z.object({}), async () => (
+      { content: [{ type: "text", text: "pong" }] }
+    ));
+
+    // Webhook trigger for n8n
+    const WebhookSchema = z.object({
+      // Use either fullUrl OR baseUrl+path
+      fullUrl: z.string().url().optional(),
+      baseUrl: z.string().url().optional(),
+      path: z.string().optional(),
+      method: z.enum(["GET","POST","PUT","PATCH"]).default("POST"),
+      headers: z.record(z.string()).default({}),
+      query: z.record(z.string()).default({}),
+      payload: z.any().optional()
+    }).refine(v => v.fullUrl || (v.baseUrl && v.path), { message: "Provide fullUrl or baseUrl+path" });
+
+    async function doFetch(url, { method='POST', headers={}, body }) {
+      const init = { method, headers };
+      if (body !== undefined) {
+        init.body = typeof body === 'string' ? body : JSON.stringify(body);
+        init.headers = { 'content-type': 'application/json', ...headers };
+      }
+      const res = await fetch(url, init);
+      const text = await res.text().catch(() => '');
+      let data; try { data = JSON.parse(text); } catch { data = text; }
+      return { ok: res.ok, status: res.status, data };
+    }
 
     server.tool(
-      "n8n_api_command",
-      "Call any n8n REST API endpoint with optional query and payload",
-      ApiSchema,
-      async ({ endpoint, method, query, payload, apiKey, baseUrl }) => {
-        const urlBase = baseUrl || process.env.N8N_BASE_URL;
-        const token = apiKey || process.env.N8N_API_KEY;
+      "n8n_webhook_call",
+      "Invoke an n8n Webhook and return its response.",
+      WebhookSchema,
+      async (args) => {
+        const base = args.fullUrl ? null : (args.baseUrl || process.env.N8N_BASE_URL);
+        const path = args.fullUrl ? null : (args.path || process.env.N8N_WEBHOOK_PATH);
+        const urlStr = args.fullUrl ? args.fullUrl : new URL(path, base).toString();
 
-        if (!urlBase || !token) {
-          return {
-            content: [
-              { type: "text", text: "Missing configuration: set baseUrl/apiKey or use env vars N8N_BASE_URL + N8N_API_KEY." }
-            ]
-          };
-        }
+        const u = new URL(urlStr);
+        for (const [k,v] of Object.entries(args.query || {})) u.searchParams.set(k, v);
 
-        // Build full URL with query params
-        const url = new URL(endpoint, urlBase);
-        Object.entries(query).forEach(([k, v]) => url.searchParams.set(k, v));
-
-        const headers = {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json"
-        };
-
-        const res = await fetch(url.toString(), {
-          method,
-          headers,
-          body: ["POST", "PUT", "PATCH"].includes(method) ? JSON.stringify(payload || {}) : undefined
+        const res = await doFetch(u.toString(), {
+          method: args.method,
+          headers: args.headers || {},
+          body: args.payload
         });
-
-        const text = await res.text();
-        let data;
-        try {
-          data = JSON.parse(text);
-        } catch {
-          data = text;
-        }
 
         return {
           content: [
             { type: "text", text: `HTTP ${res.status} ${res.ok ? "OK" : "ERROR"}` },
-            { type: "text", text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }
+            { type: "text", text: typeof res.data === 'string' ? res.data : JSON.stringify(res.data, null, 2) }
           ]
         };
       }
     );
 
-    console.log("[MCP] registered tool: n8n_api_command");
+    console.log("[MCP] registering tools: ping_tool, n8n_webhook_call");
   }
 };
