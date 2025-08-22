@@ -1,0 +1,6 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schemas/mcp.json",
+  "version": "1.0",
+  "services": [],
+  "toolChains": []
+}
