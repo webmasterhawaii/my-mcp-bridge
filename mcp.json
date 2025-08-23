@@ -6,13 +6,25 @@
       "type": "websocket_bridge",
       "name": "secure-wss-bridge",
       "endpointEnv": "MCP_ENDPOINT",
-      "reconnect": { "enabled": true, "minDelayMs": 2000, "maxDelayMs": 10000, "jitter": 0.15 },
-      "heartbeat": { "enabled": true, "intervalMs": 55000, "timeoutMs": 15000 }
+      "reconnect": {
+        "enabled": true,
+        "minDelayMs": 2000,
+        "maxDelayMs": 10000,
+        "jitter": 0.15
+      },
+      "heartbeat": {
+        "enabled": true,
+        "intervalMs": 55000,
+        "timeoutMs": 15000
+      }
     },
     {
       "type": "stdio_composer",
       "name": "local-composer",
-      "watch": ["./mcp.json", "/app/custom-mcp-config.js"]
+      "watch": [
+        "./mcp.json",
+        "/app/custom-mcp-config.js"
+      ]
     }
   ],
   "toolChains": [
