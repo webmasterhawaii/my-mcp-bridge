@@ -1,14 +1,16 @@
-FROM node:20-alpine
+FROM python:3.11-slim
+
 WORKDIR /app
+COPY server.py mcp_pipe.py requirements.txt ./
 
-# Install the CLI once at build time
-RUN npm i -g mcp_exe@0.12.0
+# system deps (optional but useful for SSL/requests)
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Copy your app
-COPY . .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Helpful for surfacing errors instead of swallowing them
-ENV NODE_OPTIONS=--unhandled-rejections=strict
+# ENV you’ll set in Railway’s Variables UI:
+# MCP_ENDPOINT   = wss://api.xiaozhi.me/mcp/?token=...
+# N8N_BASE_URL   = https://n8n-808-xxxx.vm.elestio.app
+# N8N_WEBHOOK_PATH = /webhook/xiaozhi
 
-# Run the bridge
-CMD ["sh","-c","mcp_exe --ws \"$WS_URL\" --mcp-config ./mcp.json --mcp-js ./custom-mcp-config.js --verbose"]
+CMD ["python", "mcp_pipe.py", "server.py"]
