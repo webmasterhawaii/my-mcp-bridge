@@ -19,7 +19,7 @@ module.exports = {
       return { ok: res.ok, status: res.status, data };
     }
 
-    // -------- Health check tool --------
+    // Health check tool
     const Empty = z.object({});
     server.tool(
       "ping_tool",
@@ -28,48 +28,46 @@ module.exports = {
       async () => ({ content: [{ type: "text", text: "pong" }] })
     );
 
-    // -------- n8n webhook tool --------
+    // Webhook schema: very simple, we won't depend on Xiaozhi to pass anything
     const WebhookSchema = z.object({
       fullUrl: z.string().url().optional(),
       baseUrl: z.string().url().optional(),
       path: z.string().optional(),
       method: z.enum(["GET", "POST", "PUT", "PATCH"]).default("POST"),
       headers: z.record(z.string()).default({}),
-      query: z.record(z.string()).default({}),
-      payloadJson: z.string().optional(),
-      text: z.string().optional()  // allows passing user text directly
+      query: z.record(z.string()).default({})
     }).refine(v => v.fullUrl || (v.baseUrl && v.path), {
       message: "Provide fullUrl OR baseUrl+path"
-    });
+    }).passthrough();
 
     server.tool(
       "n8n_webhook_call",
-      "Automatically sends ANYTHING the user says to your n8n webhook.",
+      "Automatically forwards ALL user input to your n8n webhook.",
       WebhookSchema,
       async (args, context) => {
-        // 🔹 Grab user text from Xiaozhi’s context if not explicitly provided
-        let userText = args.text || (context?.lastUserMessage) || null;
-
-        // Build URL
+        // Build webhook URL
         const base = args.fullUrl ? null : (args.baseUrl || process.env.N8N_BASE_URL);
         const path = args.fullUrl ? null : (args.path || process.env.N8N_WEBHOOK_PATH);
         const urlStr = args.fullUrl ? args.fullUrl : new URL(path, base).toString();
         const u = new URL(urlStr);
         for (const [k, v] of Object.entries(args.query || {})) u.searchParams.set(k, v);
 
-        // Always build a non-empty JSON body
-        let body;
-        if (args.payloadJson && args.payloadJson.trim() !== "") {
-          try { body = JSON.parse(args.payloadJson); }
-          catch { body = { payloadParseError: true, raw: args.payloadJson }; }
-        } else if (userText) {
-          body = { text: userText };
-        } else {
-          body = { text: "(empty)" }; // guaranteed non-empty body
+        // Try to auto-extract the user's message
+        let userText = "(missing_text)";
+        if (context?.input?.text && context.input.text.trim() !== "") {
+          userText = context.input.text.trim();
+        } else if (context?.lastUserMessage && context.lastUserMessage.trim() !== "") {
+          userText = context.lastUserMessage.trim();
+        } else if (args?.message && args.message.trim() !== "") {
+          userText = args.message.trim();
         }
+
+        // Build body with guaranteed text
+        const body = { text: userText };
 
         console.log("[MCP] n8n_webhook_call sending body:", body);
 
+        // Send request to n8n
         const res = await doFetch(u.toString(), {
           method: args.method || "POST",
           headers: args.headers || {},
