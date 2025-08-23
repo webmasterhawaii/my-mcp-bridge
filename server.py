@@ -1,29 +1,54 @@
-# server.py
 from mcp.server.fastmcp import FastMCP
-import sys
-import logging
+import logging, os, requests
 
-logger = logging.getLogger('Calculator')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+mcp = FastMCP("n8n-forwarder")
 
-# Fix UTF-8 encoding for Windows console
-if sys.platform == 'win32':
-    sys.stderr.reconfigure(encoding='utf-8')
-    sys.stdout.reconfigure(encoding='utf-8')
-
-import math
-import random
-
-# Create an MCP server
-mcp = FastMCP("Calculator")
-
-# Add an addition tool
 @mcp.tool()
-def calculator(python_expression: str) -> dict:
-    """For mathamatical calculation, always use this tool to calculate the result of a python expression. You can use 'math' or 'random' directly, without 'import'."""
-    result = eval(python_expression, {"math": math, "random": random})
-    logger.info(f"Calculating formula: {python_expression}, result: {result}")
-    return {"success": True, "result": result}
+def ping() -> str:
+    """Health check."""
+    return "pong"
 
-# Start the server
+@mcp.tool()
+def n8n_query(keywords: str, method: str = "POST") -> dict:
+    """
+    Forward the user's request to n8n using BOTH:
+      - query string: ?q=...
+      - JSON body: {keywords, message, text}
+    Requires env:
+      N8N_BASE_URL (e.g. https://n8n-xxx.elestio.app)
+      N8N_WEBHOOK_PATH (e.g. /webhook/xiaozhi)
+    """
+    base = os.environ.get("N8N_BASE_URL")
+    path = os.environ.get("N8N_WEBHOOK_PATH")
+    if not base or not path:
+        return {"ok": False, "error": "Missing N8N_BASE_URL or N8N_WEBHOOK_PATH", "base": base, "path": path}
+
+    url = f"{base}{path}"
+    params = {"q": keywords}
+    body = {"keywords": keywords, "message": keywords, "text": keywords}
+    method = (method or "POST").upper()
+
+    try:
+        if method == "GET":
+            r = requests.get(url, params=params, timeout=15)
+        else:
+            r = requests.post(url, params=params, json=body, timeout=15)
+    except Exception as e:
+        return {"ok": False, "error": f"Request failed: {e}", "url": url, "params": params, "body": body}
+
+    try:
+        data = r.json()
+    except Exception:
+        data = r.text
+
+    return {
+        "ok": r.ok,
+        "status": r.status_code,
+        "url": r.url,
+        "echo": {"query_q": keywords, "body_keywords": keywords},
+        "response": data,
+    }
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
