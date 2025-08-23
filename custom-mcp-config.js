@@ -3,7 +3,6 @@ console.log("[MCP] custom-mcp-config.js loaded");
 
 module.exports = {
   configureMcp(server, ResourceTemplate, z) {
-    // Log unexpected errors so they don't fail silently during tools/list
     process.on("uncaughtException", e => console.error("[MCP] uncaughtException", e));
     process.on("unhandledRejection", e => console.error("[MCP] unhandledRejection", e));
 
@@ -15,11 +14,12 @@ module.exports = {
       }
       const res = await fetch(url, init);
       const text = await res.text().catch(() => "");
-      let data; try { data = JSON.parse(text); } catch { data = text; }
+      let data;
+      try { data = JSON.parse(text); } catch { data = text; }
       return { ok: res.ok, status: res.status, data };
     }
 
-    // -------- health check --------
+    // -------- Health check tool --------
     const Empty = z.object({});
     server.tool(
       "ping_tool",
@@ -28,30 +28,28 @@ module.exports = {
       async () => ({ content: [{ type: "text", text: "pong" }] })
     );
 
-    // -------- n8n webhook (schema kept very simple) --------
+    // -------- n8n webhook tool --------
     const WebhookSchema = z.object({
-      // Provide either fullUrl OR baseUrl+path
       fullUrl: z.string().url().optional(),
       baseUrl: z.string().url().optional(),
       path: z.string().optional(),
-
       method: z.enum(["GET", "POST", "PUT", "PATCH"]).default("POST"),
-      // Keep records as string=>string to stay serializable in tool metadata
       headers: z.record(z.string()).default({}),
       query: z.record(z.string()).default({}),
-
-      // JSON payload as a STRING; we parse it safely inside the tool
       payloadJson: z.string().optional(),
-
-      // convenience plain text (used if no payloadJson provided)
-      text: z.string().optional()
-    }).refine(v => v.fullUrl || (v.baseUrl && v.path), { message: "Provide fullUrl OR baseUrl+path" });
+      text: z.string().optional()  // allows passing user text directly
+    }).refine(v => v.fullUrl || (v.baseUrl && v.path), {
+      message: "Provide fullUrl OR baseUrl+path"
+    });
 
     server.tool(
       "n8n_webhook_call",
-      "POST/GET to your n8n Webhook and return its response. Supply payloadJson as a JSON string.",
+      "Automatically sends ANYTHING the user says to your n8n webhook.",
       WebhookSchema,
-      async (args) => {
+      async (args, context) => {
+        // 🔹 Grab user text from Xiaozhi’s context if not explicitly provided
+        let userText = args.text || (context?.lastUserMessage) || null;
+
         // Build URL
         const base = args.fullUrl ? null : (args.baseUrl || process.env.N8N_BASE_URL);
         const path = args.fullUrl ? null : (args.path || process.env.N8N_WEBHOOK_PATH);
@@ -59,16 +57,18 @@ module.exports = {
         const u = new URL(urlStr);
         for (const [k, v] of Object.entries(args.query || {})) u.searchParams.set(k, v);
 
-        // Build a non-empty body
+        // Always build a non-empty JSON body
         let body;
         if (args.payloadJson && args.payloadJson.trim() !== "") {
           try { body = JSON.parse(args.payloadJson); }
           catch { body = { payloadParseError: true, raw: args.payloadJson }; }
-        } else if (args.text) {
-          body = { text: args.text };
+        } else if (userText) {
+          body = { text: userText };
         } else {
-          body = { ping: true };
+          body = { text: "(empty)" }; // guaranteed non-empty body
         }
+
+        console.log("[MCP] n8n_webhook_call sending body:", body);
 
         const res = await doFetch(u.toString(), {
           method: args.method || "POST",
