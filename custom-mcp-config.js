@@ -14,12 +14,11 @@ module.exports = {
       }
       const res = await fetch(url, init);
       const text = await res.text().catch(() => "");
-      let data;
-      try { data = JSON.parse(text); } catch { data = text; }
+      let data; try { data = JSON.parse(text); } catch { data = text; }
       return { ok: res.ok, status: res.status, data };
     }
 
-    // Health check tool
+    // -------- health check --------
     const Empty = z.object({});
     server.tool(
       "ping_tool",
@@ -28,46 +27,74 @@ module.exports = {
       async () => ({ content: [{ type: "text", text: "pong" }] })
     );
 
-    // Webhook schema: very simple, we won't depend on Xiaozhi to pass anything
+    // -------- n8n webhook (keep schema simple) --------
     const WebhookSchema = z.object({
+      // Provide either fullUrl OR baseUrl+path
       fullUrl: z.string().url().optional(),
       baseUrl: z.string().url().optional(),
       path: z.string().optional(),
-      method: z.enum(["GET", "POST", "PUT", "PATCH"]).default("POST"),
+
+      method: z.enum(["GET","POST","PUT","PATCH"]).default("POST"),
       headers: z.record(z.string()).default({}),
-      query: z.record(z.string()).default({})
+      query: z.record(z.string()).default({}),
+
+      // Preferred inputs
+      payloadJson: z.string().optional(), // stringified JSON
+      text: z.string().optional()         // plain text
     }).refine(v => v.fullUrl || (v.baseUrl && v.path), {
       message: "Provide fullUrl OR baseUrl+path"
-    }).passthrough();
+    });
 
     server.tool(
       "n8n_webhook_call",
-      "Automatically forwards ALL user input to your n8n webhook.",
+      "Send user's utterance to n8n webhook and return the response.",
       WebhookSchema,
       async (args, context) => {
-        // Build webhook URL
+        // Build URL
         const base = args.fullUrl ? null : (args.baseUrl || process.env.N8N_BASE_URL);
         const path = args.fullUrl ? null : (args.path || process.env.N8N_WEBHOOK_PATH);
         const urlStr = args.fullUrl ? args.fullUrl : new URL(path, base).toString();
         const u = new URL(urlStr);
         for (const [k, v] of Object.entries(args.query || {})) u.searchParams.set(k, v);
 
-        // Try to auto-extract the user's message
-        let userText = "(missing_text)";
-        if (context?.input?.text && context.input.text.trim() !== "") {
-          userText = context.input.text.trim();
-        } else if (context?.lastUserMessage && context.lastUserMessage.trim() !== "") {
-          userText = context.lastUserMessage.trim();
-        } else if (args?.message && args.message.trim() !== "") {
-          userText = args.message.trim();
+        // Derive user text from (1) payloadJson, (2) text, (3) context
+        let userText;
+
+        if (typeof args.payloadJson === "string" && args.payloadJson.trim() !== "") {
+          try {
+            const pj = JSON.parse(args.payloadJson);
+            if (typeof pj?.text === "string" && pj.text.trim() !== "") {
+              userText = pj.text;
+            } else {
+              // fallback: use the whole object as a compact string
+              userText = JSON.stringify(pj);
+            }
+          } catch {
+            userText = args.payloadJson; // raw string if not valid JSON
+          }
         }
 
-        // Build body with guaranteed text
+        if (!userText && typeof args.text === "string" && args.text.trim() !== "") {
+          userText = args.text.trim();
+        }
+
+        // Try runtime context (may not be provided by all MCP hosts)
+        if (!userText && typeof context?.input?.text === "string" && context.input.text.trim() !== "") {
+          userText = context.input.text.trim();
+        }
+        if (!userText && typeof context?.lastUserMessage === "string" && context.lastUserMessage.trim() !== "") {
+          userText = context.lastUserMessage.trim();
+        }
+
+        // Final fallback so n8n never sees an empty body
+        if (!userText) userText = "(missing_text_from_agent)";
+
         const body = { text: userText };
 
-        console.log("[MCP] n8n_webhook_call sending body:", body);
+        try {
+          console.log("[MCP] n8n_webhook_call body:", body);
+        } catch {}
 
-        // Send request to n8n
         const res = await doFetch(u.toString(), {
           method: args.method || "POST",
           headers: args.headers || {},
