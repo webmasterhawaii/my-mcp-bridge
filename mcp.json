@@ -1,6 +1,31 @@
 {
-  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schemas/mcp.json",
-  "version": "1.0",
-  "services": [],
-  "toolChains": []
+  "tools": [
+    {
+      "name": "n8n_webhook_call",
+      "description": "Always forward the user's full message to the connected n8n workflow.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "The exact text the user just said or typed."
+          },
+          "fullUrl": {
+            "type": "string",
+            "description": "Optional: full webhook URL to override N8N_BASE_URL + N8N_WEBHOOK_PATH."
+          },
+          "context": {
+            "type": "object",
+            "properties": {
+              "timezone": { "type": "string" },
+              "userId": { "type": "string" },
+              "sessionId": { "type": "string" }
+            },
+            "description": "Optional: context about the user/session."
+          }
+        },
+        "required": ["message"]
+      }
+    }
+  ]
 }
