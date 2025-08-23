@@ -1,31 +1,51 @@
 {
-  "tools": [
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schemas/mcp.json",
+  "version": "1.0",
+
+  "services": [
     {
-      "name": "n8n_webhook_call",
-      "description": "Always forward the user's full message to the connected n8n workflow.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "message": {
-            "type": "string",
-            "description": "The exact text the user just said or typed."
-          },
-          "fullUrl": {
-            "type": "string",
-            "description": "Optional: full webhook URL to override N8N_BASE_URL + N8N_WEBHOOK_PATH."
-          },
-          "context": {
-            "type": "object",
-            "properties": {
-              "timezone": { "type": "string" },
-              "userId": { "type": "string" },
-              "sessionId": { "type": "string" }
-            },
-            "description": "Optional: context about the user/session."
-          }
-        },
-        "required": ["message"]
+      "type": "websocket_bridge",
+      "name": "secure-wss-bridge",
+
+      /* Where to get the WS URL; you already pass it via env:
+         MCP_ENDPOINT=wss://api.xiaozhi.me/mcp/?token=... */
+      "endpointEnv": "MCP_ENDPOINT",
+
+      /* Auto-reconnect settings */
+      "reconnect": {
+        "enabled": true,
+        "minDelayMs": 2000,
+        "maxDelayMs": 10000,
+        "jitter": 0.15
+      },
+
+      /* Heartbeat/ping to keep the socket alive */
+      "heartbeat": {
+        "enabled": true,
+        "intervalMs": 55000,
+        "timeoutMs": 15000
       }
+    },
+
+    {
+      /* The in-process “composer” that loads your custom-mcp-config.js
+         and registers tools (ping_tool, n8n_webhook_call). */
+      "type": "stdio_composer",
+      "name": "local-composer",
+
+      /* Watch these files and hot-reload when they change */
+      "watch": [
+        "./mcp.json",
+        "/app/custom-mcp-config.js"
+      ]
+    }
+  ],
+
+  /* Pipe tools from the composer to the websocket bridge */
+  "toolChains": [
+    {
+      "from": "local-composer",
+      "to": "secure-wss-bridge"
     }
   ]
 }
