@@ -28,9 +28,6 @@
     }
   ],
   "toolChains": [
-    {
-      "from": "local-composer",
-      "to": "secure-wss-bridge"
-    }
+    ["local-composer", "secure-wss-bridge"]
   ]
 }
