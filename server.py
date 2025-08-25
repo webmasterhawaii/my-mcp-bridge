@@ -1,8 +1,24 @@
 from mcp.server.fastmcp import FastMCP
-import logging, os, requests, json
+import logging, os, requests, json, threading, uuid
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 mcp = FastMCP("n8n-forwarder")
+
+def _post_to_n8n(url: str, params: dict, body: dict):
+    """Background worker: fire the webhook and log the result. Non-blocking for Xiaozhi."""
+    try:
+        # You can raise/adjust timeout if your workflow is slow; this does NOT affect Xiaozhi now.
+        r = requests.post(url, params=params, json=body, timeout=30, headers={"User-Agent": "mcp-n8n/1.0"})
+        try:
+            data = r.json()
+        except Exception:
+            data = r.text
+        print(f"[n8n_async] HTTP {r.status_code} ok={r.ok} url={r.url}", flush=True)
+        # Keep logs short:
+        preview = (json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data))[:600]
+        print(f"[n8n_async] response_preview={preview}", flush=True)
+    except Exception as e:
+        print(f"[n8n_async] ERROR posting to n8n: {e}", flush=True)
 
 @mcp.tool()
 def ping() -> str:
@@ -10,13 +26,17 @@ def ping() -> str:
     return "pong"
 
 @mcp.tool()
-def n8n_query(keywords: str, method: str = "POST") -> dict:
+def n8n_query(keywords: str, correlation_id: str = "") -> dict:
     """
-    Forward the user's message to n8n.
+    Fire-and-forget forward of the user's request to n8n, then return instantly.
+
     Sends BOTH:
-      • query: ?q=<keywords>
-      • JSON body: {keywords, message, text}
-    Returns a SHORT summary in 'result' so Xiaozhi speaks it.
+      • query string: ?q=<keywords>&cid=<correlation_id>
+      • JSON body:   { keywords, message, text, correlationId }
+
+    Env required:
+      N8N_BASE_URL   e.g. https://n8n-xxx.elestio.app   (no trailing slash)
+      N8N_WEBHOOK_PATH e.g. /webhook/xiaozhi            (leading slash)
     """
     base = os.environ.get("N8N_BASE_URL")
     path = os.environ.get("N8N_WEBHOOK_PATH")
@@ -27,55 +47,27 @@ def n8n_query(keywords: str, method: str = "POST") -> dict:
         }
 
     kw = (keywords or "").strip() or "(empty)"
+    cid = correlation_id.strip() or str(uuid.uuid4())
     url = f"{base}{path}"
-    params = {"q": kw}
-    body = {"keywords": kw, "message": kw, "text": kw}
+    params = {"q": kw, "cid": cid}
+    body = {"keywords": kw, "message": kw, "text": kw, "correlationId": cid}
 
-    # Log exactly what we send (Railway)
+    # Log what we are sending (visible in Railway logs)
     print(f"[n8n_query] URL: {url}", flush=True)
     print(f"[n8n_query] PARAMS: {json.dumps(params, ensure_ascii=False)}", flush=True)
     print(f"[n8n_query] BODY: {json.dumps(body, ensure_ascii=False)}", flush=True)
 
-    method = (method or "POST").upper()
-    try:
-        if method == "GET":
-            r = requests.get(url, params=params, timeout=8, headers={"User-Agent":"mcp-n8n/1.0"})
-        else:
-            r = requests.post(url, params=params, json=body, timeout=8, headers={"User-Agent":"mcp-n8n/1.0"})
-    except Exception as e:
-        return {
-            "ok": False,
-            "result": f"Request to n8n failed: {e}",
-        }
+    # Spawn background thread so we return immediately to Xiaozhi
+    t = threading.Thread(target=_post_to_n8n, args=(url, params, body), daemon=True)
+    t.start()
 
-    # Parse response lightly
-    try:
-        data = r.json()
-        data_text = json.dumps(data, ensure_ascii=False)
-    except Exception:
-        data = r.text
-        data_text = str(data)
-
-    # Build a short, user-facing summary
-    if isinstance(data, dict) and "summary" in data and isinstance(data["summary"], str) and data["summary"].strip():
-        summary = data["summary"].strip()
-    else:
-        if r.ok:
-            summary = f"Done (HTTP {r.status_code})."
-        else:
-            summary = f"n8n returned HTTP {r.status_code}."
-
-    # Trim preview so total payload stays small (<~1KB)
-    preview = data_text[:600]
-    print(f"[n8n_query] response_len={len(data_text)}, preview_len={len(preview)}", flush=True)
-
+    # Return a tiny payload so Xiaozhi speaks it and doesn't time out
     return {
-        "ok": bool(r.ok),
-        "status": int(r.status_code),
-        # 👇 Xiaozhi will read/use this
-        "result": summary,
-        # Tiny preview only; remove if you want it even smaller
-        "data_preview": preview
+        "ok": True,
+        "status": "accepted",
+        "correlationId": cid,
+        # 👇 short string; Xiaozhi will speak this
+        "result": f"Got it. Working on “{kw}”. (id: {cid[:8]})"
     }
 
 if __name__ == "__main__":
