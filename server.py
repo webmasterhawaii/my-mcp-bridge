@@ -1,76 +1,47 @@
+# server.py
 from mcp.server.fastmcp import FastMCP
-import logging, os, requests, json, threading, uuid, time
+import logging, os, requests, uuid, time, threading
 
-# Logs go to stderr by default -> SAFE for MCP stdio
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("n8n-forwarder")
+log = logging.getLogger("n8n-forwarder")
 
 mcp = FastMCP("n8n-forwarder")
 
-# ---------- helpers ----------
-
-def _build_urls():
-    base = os.environ.get("N8N_BASE_URL")
-    path = os.environ.get("N8N_WEBHOOK_PATH")
-    status_path = os.environ.get("N8N_STATUS_PATH")  # optional
+# -----------------------------
+# helpers
+# -----------------------------
+def _build_n8n_target():
+    base = os.environ.get("N8N_BASE_URL", "").rstrip("/")
+    path = os.environ.get("N8N_WEBHOOK_PATH", "")
+    if not path.startswith("/"):
+        path = "/" + path
+    url = f"{base}{path}"
     if not base or not path:
         raise RuntimeError("Missing N8N_BASE_URL or N8N_WEBHOOK_PATH")
-    return f"{base}{path}", (f"{base}{status_path}" if status_path else None)
+    return url
 
-def _short(s: str, n: int = 600) -> str:
-    s = (s or "").strip()
-    return s if len(s) <= n else (s[:n] + "…")
+def _truncate(txt: str, max_len: int = 900) -> str:
+    txt = (txt or "").strip()
+    if len(txt) > max_len:
+        return txt[: max_len - 1] + "…"
+    return txt
 
-def _as_text(data) -> str:
-    try:
-        return json.dumps(data, ensure_ascii=False) if isinstance(data, (dict, list)) else str(data)
-    except Exception:
-        return str(data)
-
-def _post_async(url: str, params: dict, body: dict):
-    """Background worker: post to n8n (logs only)."""
-    try:
-        r = requests.post(url, params=params, json=body, timeout=30, headers={"User-Agent": "mcp-n8n/1.0"})
+def _fire_and_forget(method: str, url: str, params: dict, json_body: dict):
+    """Background delivery for auto/async mode; does NOT return anything to the model."""
+    def _run():
         try:
-            data = r.json()
-        except Exception:
-            data = r.text
-        logger.info("[n8n_async] HTTP %s ok=%s url=%s", r.status_code, r.ok, r.url)
-        logger.info("[n8n_async] response_preview=%s", _short(_as_text(data)))
-    except Exception as e:
-        logger.warning("[n8n_async] ERROR: %s", e)
+            if method == "GET":
+                requests.get(url, params=params, timeout=20)
+            else:
+                requests.post(url, params=params, json=json_body, timeout=20)
+        except Exception as e:
+            log.warning("[n8n_async_bg] delivery failed: %s", e)
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
 
-def _call_sync(url: str, params: dict, body: dict, method: str, timeout: int):
-    """Synchronous call to n8n; returns a SHORT string for Xiaozhi to speak."""
-    method = (method or "POST").upper()
-    try:
-        if method == "GET":
-            r = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": "mcp-n8n/1.0"})
-        else:
-            r = requests.post(url, params=params, json=body, timeout=timeout, headers={"User-Agent": "mcp-n8n/1.0"})
-    except Exception as e:
-        return f"Request to n8n failed: {e}"
-
-    # Parse, then extract a tiny human sentence
-    try:
-        data = r.json()
-    except Exception:
-        data = r.text
-
-    # Prefer a concise summary from n8n
-    summary = None
-    if isinstance(data, dict):
-        if isinstance(data.get("summary"), str) and data["summary"].strip():
-            summary = data["summary"].strip()
-        elif isinstance(data.get("data"), dict) and isinstance(data["data"].get("output"), str):
-            summary = _short(data["data"]["output"])
-    if not summary:
-        summary = f"Done. (HTTP {r.status_code})" if r.ok else f"n8n returned HTTP {r.status_code}."
-
-    return _short(summary, 800)  # keep well under ~1KB
-
-# ---------- tools ----------
-
+# -----------------------------
+# tools
+# -----------------------------
 @mcp.tool()
 def ping() -> str:
     """Health check."""
@@ -79,79 +50,104 @@ def ping() -> str:
 @mcp.tool()
 def n8n_query(
     keywords: str,
-    mode: str = "auto",          # "auto" | "sync" | "async"
-    waitSeconds: int = 7,        # used when mode in {"auto","sync"}
     method: str = "POST",
-    correlation_id: str = "",
+    mode: str = "sync",           # "sync" | "auto" | "async"
+    waitSeconds: int = 22,        # only used for sync/auto
 ) -> str:
     """
-    Dual-mode forward to n8n. Always returns a SHORT STRING for Xiaozhi to speak.
+    Send the user's request to n8n and (in sync/auto modes) return the webhook's response
+    as a PLAIN STRING so the assistant can speak it.
 
-    Sends BOTH:
-      • query: ?q=<keywords>&cid=<uuid>
-      • body:  {keywords, message, text, correlationId}
+    ENV required:
+      N8N_BASE_URL     e.g. https://n8n-xxxx.elestio.app
+      N8N_WEBHOOK_PATH e.g. /webhook/xiaozhi
+
+    Args:
+      keywords: the user command / query text
+      method:   "POST" (default) or "GET"
+      mode:     "sync" (default), "auto" (try sync then fallback to async on timeout), or "async"
+      waitSeconds: max seconds we wait for the synchronous HTTP to finish (cap ~25)
     """
-    try:
-        url, _status_url = _build_urls()
-    except RuntimeError as e:
-        return str(e)
+    # ---------------- inputs / target
+    url = _build_n8n_target()
+    cid = str(uuid.uuid4())
+    method = (method or "POST").upper()
+    mode = (mode or "sync").lower()
 
-    kw = (keywords or "").strip() or "(empty)"
-    cid = (correlation_id or "").strip() or str(uuid.uuid4())
-    params = {"q": kw, "cid": cid}
-    body = {"keywords": kw, "message": kw, "text": kw, "correlationId": cid}
+    params = {"q": keywords, "cid": cid}
+    body = {
+        "keywords": keywords,
+        "message": keywords,
+        "text": keywords,
+        "correlationId": cid,
+    }
 
-    logger.info("[n8n_query] mode=%s wait=%ss URL=%s", mode, waitSeconds, url)
-    logger.info("[n8n_query] PARAMS=%s", _as_text(params))
-    logger.info("[n8n_query] BODY=%s", _as_text(body))
-
-    mode = (mode or "auto").lower()
-    wait = max(1, min(int(waitSeconds or 7), 12))  # under Xiaozhi’s timeout
-
+    # ---------------- async-only path
     if mode == "async":
-        threading.Thread(target=_post_async, args=(url, params, body), daemon=True).start()
-        return f"Got it. Working on “{kw}”. (id: {cid[:8]})"
+        _fire_and_forget(method, url, params, body)
+        return "Got it — I’m working on that now."
 
-    if mode == "sync":
-        summary = _call_sync(url, params, body, method, timeout=wait)
-        return summary
+    # ---------------- sync / auto path
+    # Enforce a safe wait ceiling; Xiaozhi typically can’t wait much > ~25s
+    wait = max(5, min(int(waitSeconds or 22), 25))
 
-    # auto: try sync quickly, then async fallback
-    summary = _call_sync(url, params, body, method, timeout=wait)
-    if summary.startswith("Done.") or summary.startswith("n8n returned HTTP 2"):
-        return summary
-    # If it wasn’t a clear success, fall back to async fire-and-forget
-    logger.info("[n8n_query:auto] fallback to async")
-    threading.Thread(target=_post_async, args=(url, params, body), daemon=True).start()
-    return f"Working on “{kw}”. I’ll keep going in the background. (id: {cid[:8]})"
+    log.info("[n8n_query] mode=%s wait=%ss URL=%s", mode, wait, url)
+    log.info("[n8n_query] PARAMS=%s", params)
+    log.info("[n8n_query] BODY=%s", body)
 
-@mcp.tool()
-def n8n_get_status(correlation_id: str) -> str:
-    """
-    Optional status poller (needs N8N_STATUS_PATH). Returns a SHORT STRING.
-    """
-    base = os.environ.get("N8N_BASE_URL")
-    status_path = os.environ.get("N8N_STATUS_PATH")
-    if not base or not status_path:
-        return "Status endpoint not configured (set N8N_STATUS_PATH)."
-
-    url = f"{base}{status_path}"
-    params = {"cid": correlation_id}
+    start = time.time()
     try:
-        r = requests.get(url, params=params, timeout=8, headers={"User-Agent": "mcp-n8n/1.0"})
-        try:
-            data = r.json()
-        except Exception:
-            data = r.text
+        if method == "GET":
+            resp = requests.get(url, params=params, timeout=wait)
+        else:
+            resp = requests.post(url, params=params, json=body, timeout=wait)
+    except requests.Timeout:
+        # only fall back to async if explicitly in auto
+        if mode == "auto":
+            log.info("[n8n_query:auto] sync timed out; falling back to async fire-and-forget")
+            _fire_and_forget(method, url, params, body)
+            return "Working on it — I’ll update you shortly."
+        # sync mode: no fallback, return a helpful message
+        return "Still working on that; please try again in a moment."
     except Exception as e:
-        return f"Status check failed: {e}"
+        log.warning("[n8n_query] request failed: %s", e)
+        return "I couldn’t reach the workflow service."
 
-    if isinstance(data, dict):
-        if isinstance(data.get("summary"), str) and data["summary"].strip():
-            return _short(data["summary"])
-        if isinstance(data.get("data"), dict) and isinstance(data["data"].get("output"), str):
-            return _short(data["data"]["output"])
-    return f"Status HTTP {getattr(r, 'status_code', '?')}."
+    # ---------------- normalize response to plain text
+    # We prefer text; if JSON, reduce it to a short string if possible.
+    text = None
+    ctype = resp.headers.get("content-type", "")
+    if "text/" in ctype or "plain" in ctype:
+        text = resp.text
+    else:
+        # attempt JSON decode; flatten common shapes
+        try:
+            data = resp.json()
+        except Exception:
+            data = resp.text
 
+        if isinstance(data, dict):
+            # common shapes you used earlier:
+            # - { text: "..." }
+            # - { summary: "..." } or { summary: { output: "..." } }
+            # - { data: { output: "..." } }
+            text = (
+                (isinstance(data.get("text"), str) and data.get("text"))
+                or (isinstance(data.get("summary"), str) and data.get("summary"))
+                or (isinstance(data.get("summary"), dict) and isinstance(data["summary"].get("output"), str) and data["summary"]["output"])
+                or (isinstance(data.get("data"), dict) and isinstance(data["data"].get("output"), str) and data["data"]["output"])
+                or str(data)
+            )
+        else:
+            text = str(data)
+
+    # Truncate to be safe for MCP/iot-like limits
+    spoken = _truncate(text or "Done.")
+    return spoken
+
+# -----------------------------
+# run
+# -----------------------------
 if __name__ == "__main__":
+    # Use stdio transport; your mcp_pipe.py bridges this to Xiaozhi’s WSS
     mcp.run(transport="stdio")
