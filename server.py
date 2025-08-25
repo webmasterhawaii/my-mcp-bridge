@@ -12,62 +12,70 @@ def ping() -> str:
 @mcp.tool()
 def n8n_query(keywords: str, method: str = "POST") -> dict:
     """
-    ALWAYS use this tool to forward the user's message to my n8n workflow.
-    Put the full user utterance into 'keywords'.
-    The tool sends BOTH:
-      • query string: ?q=<keywords>
-      • JSON body: {keywords, message, text: <keywords>}
-    Env required:
-      N8N_BASE_URL (e.g. https://n8n-xxx.elestio.app   ; no trailing slash)
-      N8N_WEBHOOK_PATH (e.g. /webhook/xiaozhi          ; leading slash)
+    Forward the user's message to n8n.
+    Sends BOTH:
+      • query: ?q=<keywords>
+      • JSON body: {keywords, message, text}
+    Returns a SHORT summary in 'result' so Xiaozhi speaks it.
     """
     base = os.environ.get("N8N_BASE_URL")
     path = os.environ.get("N8N_WEBHOOK_PATH")
     if not base or not path:
         return {
             "ok": False,
-            "error": "Missing N8N_BASE_URL or N8N_WEBHOOK_PATH",
-            "base": base,
-            "path": path
+            "result": "n8n is not configured (missing N8N_BASE_URL or N8N_WEBHOOK_PATH).",
         }
 
-    # guarantee non-empty string
     kw = (keywords or "").strip() or "(empty)"
     url = f"{base}{path}"
     params = {"q": kw}
     body = {"keywords": kw, "message": kw, "text": kw}
-    method = (method or "POST").upper()
 
-    # 🔊 log exactly what we'll send (shows in Railway logs)
+    # Log exactly what we send (Railway)
     print(f"[n8n_query] URL: {url}", flush=True)
     print(f"[n8n_query] PARAMS: {json.dumps(params, ensure_ascii=False)}", flush=True)
     print(f"[n8n_query] BODY: {json.dumps(body, ensure_ascii=False)}", flush=True)
 
+    method = (method or "POST").upper()
     try:
         if method == "GET":
-            r = requests.get(url, params=params, timeout=15, headers={"User-Agent":"mcp-n8n/1.0"})
+            r = requests.get(url, params=params, timeout=8, headers={"User-Agent":"mcp-n8n/1.0"})
         else:
-            r = requests.post(url, params=params, json=body, timeout=15, headers={"User-Agent":"mcp-n8n/1.0"})
+            r = requests.post(url, params=params, json=body, timeout=8, headers={"User-Agent":"mcp-n8n/1.0"})
     except Exception as e:
         return {
             "ok": False,
-            "status": None,
-            "error": f"Request failed: {e}",
-            "url": url,
-            "sent": {"params": params, "body": body}
+            "result": f"Request to n8n failed: {e}",
         }
 
+    # Parse response lightly
     try:
         data = r.json()
+        data_text = json.dumps(data, ensure_ascii=False)
     except Exception:
         data = r.text
+        data_text = str(data)
+
+    # Build a short, user-facing summary
+    if isinstance(data, dict) and "summary" in data and isinstance(data["summary"], str) and data["summary"].strip():
+        summary = data["summary"].strip()
+    else:
+        if r.ok:
+            summary = f"Done (HTTP {r.status_code})."
+        else:
+            summary = f"n8n returned HTTP {r.status_code}."
+
+    # Trim preview so total payload stays small (<~1KB)
+    preview = data_text[:600]
+    print(f"[n8n_query] response_len={len(data_text)}, preview_len={len(preview)}", flush=True)
 
     return {
-        "ok": r.ok,
-        "status": r.status_code,
-        "url": r.url,
-        "echo": {"query_q": kw, "body_keywords": kw},
-        "response": data
+        "ok": bool(r.ok),
+        "status": int(r.status_code),
+        # 👇 Xiaozhi will read/use this
+        "result": summary,
+        # Tiny preview only; remove if you want it even smaller
+        "data_preview": preview
     }
 
 if __name__ == "__main__":
