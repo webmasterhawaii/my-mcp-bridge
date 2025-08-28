@@ -1,24 +1,20 @@
 # server.py
 from mcp.server.fastmcp import FastMCP
-import logging, os, requests, uuid, threading, time
+import logging, os, requests, uuid, threading, time, re
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger("n8n-async-poller")
 
 mcp = FastMCP("n8n-async-poller")
 
-# In-memory job store:
-# JOBS[cid] = {
-#   status: "pending" | "done" | "error",
-#   started: float,
-#   updated: float,
-#   last_spoken: float,
-#   message: str,        # final message (when done/error) or unused
-#   delivered: bool,     # True once we've spoken the final result
-# }
+# In-memory job store: { cid: {"status": "pending|done|error", "started": ts, "updated": ts, "message": str} }
 JOBS = {}
 
-# ---------- helpers ----------
+# Simple recent-dedupe window: for 30s, reuse the same cid for the same (normalized) keywords
+RECENT_WINDOW_SECS = 30
+RECENT_BY_KEY = {}  # norm_keywords -> {"cid": str, "ts": float}
+
+# ---- helpers ----
 
 def _build_n8n_url():
     base = os.environ.get("N8N_BASE_URL", "").rstrip("/")
@@ -40,21 +36,24 @@ def _extract_speakable(resp):
         return (resp.text or "").strip() or "Done."
     if isinstance(data, dict):
         return (
-            (isinstance(data.get("text"), str) and data["text"])
-            or (isinstance(data.get("summary"), str) and data["summary"])
-            or (isinstance(data.get("summary"), dict)
-                and isinstance(data["summary"].get("output"), str)
-                and data["summary"]["output"])
-            or (isinstance(data.get("data"), dict)
-                and isinstance(data["data"].get("output"), str)
-                and data["data"]["output"])
-            or str(data)
+            (isinstance(data.get("text"), str) and data["text"]) or
+            (isinstance(data.get("summary"), str) and data["summary"]) or
+            (isinstance(data.get("summary"), dict) and isinstance(data["summary"].get("output"), str) and data["summary"]["output"]) or
+            (isinstance(data.get("data"), dict) and isinstance(data["data"].get("output"), str) and data["data"]["output"]) or
+            str(data)
         )
     return str(data)
 
 def _truncate(txt: str, n=900):
     txt = (txt or "").strip()
     return txt if len(txt) <= n else txt[: n - 1] + "…"
+
+def _normalize_keywords(s: str) -> str:
+    """Lowercase, trim, collapse spaces; remove noisy punctuation. Used for dedup key."""
+    s = (s or "").lower().strip()
+    s = re.sub(r"[^\w\s-]+", "", s)          # remove punctuation except hyphen/underscore
+    s = re.sub(r"\s+", " ", s)               # collapse whitespace
+    return s
 
 def _run_n8n_job(cid: str, keywords: str, method: str):
     """Background worker that hits n8n and stores the result into JOBS[cid]."""
@@ -66,38 +65,54 @@ def _run_n8n_job(cid: str, keywords: str, method: str):
             resp = requests.get(url, params=params, timeout=40)
         else:
             resp = requests.post(url, params=params, json=body, timeout=40)
-        speakable = _truncate(_extract_speakable(resp)) or "Done."
+        text = _truncate(_extract_speakable(resp)) or "Done."
         status = "done" if resp.ok else "error"
-        msg = speakable if resp.ok else f"Request failed ({resp.status_code})."
+        msg = text if resp.ok else f"Request failed ({resp.status_code})."
     except requests.Timeout:
-        status, msg = "error", "Request timed out upstream."
+        status = "error"
+        msg = "Request timed out upstream."
     except Exception as e:
-        status, msg = "error", f"Request error: {e}"
+        status = "error"
+        msg = f"Request error: {e}"
 
-    job = JOBS.get(cid)
-    if job:
-        job["status"] = status
-        job["message"] = msg
-        job["updated"] = time.time()
+    JOBS[cid]["status"] = status
+    JOBS[cid]["message"] = msg
+    JOBS[cid]["updated"] = time.time()
 
-# ---------- tools ----------
+# ---- tools ----
 
 @mcp.tool()
-def start_n8n_job(keywords: str, method: str = "POST") -> dict:
+def start_n8n_job(keywords: str, method: str = "POST", force_new: bool = False) -> dict:
     """
     Start an asynchronous n8n job. Returns a correlation ID immediately.
-    The assistant should poll with poll_n8n_job every ~2–3s to keep the session alive.
+    Deduplicates identical (normalized) keywords for 30s to avoid duplicate jobs.
+    Set force_new=true to bypass dedup.
     """
-    cid = str(uuid.uuid4())
+    norm = _normalize_keywords(keywords)
     now = time.time()
-    JOBS[cid] = {
-        "status": "pending",
-        "started": now,
-        "updated": now,
-        "last_spoken": 0.0,
-        "message": "",
-        "delivered": False,
-    }
+
+    # purge old RECENT entries
+    for k in list(RECENT_BY_KEY.keys()):
+        if now - RECENT_BY_KEY[k]["ts"] > RECENT_WINDOW_SECS:
+            del RECENT_BY_KEY[k]
+
+    if not force_new and norm in RECENT_BY_KEY:
+        existing = RECENT_BY_KEY[norm]
+        cid = existing["cid"]
+        job = JOBS.get(cid)
+        if job and job["status"] == "pending":
+            # reuse current job
+            return {
+                "cid": cid,
+                "status": "pending",
+                "message": "Already working on that — I’ll keep you posted.",
+                "next_poll_after_ms": 2000
+            }
+
+    # start a new job
+    cid = str(uuid.uuid4())
+    JOBS[cid] = {"status": "pending", "started": now, "updated": now, "message": ""}
+    RECENT_BY_KEY[norm] = {"cid": cid, "ts": now}
     method = (method or "POST").upper()
 
     t = threading.Thread(target=_run_n8n_job, args=(cid, keywords, method), daemon=True)
@@ -107,84 +122,47 @@ def start_n8n_job(keywords: str, method: str = "POST") -> dict:
         "cid": cid,
         "status": "pending",
         "message": "Got it — I’m on it. I’ll keep you posted.",
-        "next_poll_after_ms": 2000  # first follow-up poll suggestion
+        "next_poll_after_ms": 2000
     }
 
 @mcp.tool()
-def poll_n8n_job(
-    cid: str,
-    speak_progress_every_secs: int = 6,
-    max_wait_secs: int = 0
-) -> dict:
+def poll_n8n_job(cid: str) -> dict:
     """
-    Polls status:
-      - Always returns fast to avoid timeouts.
-      - While pending: only include a progress *message* every `speak_progress_every_secs`.
-        (Silent polls keep the session alive but won't make the agent speak.)
-      - When done/error: return the final message *once* and mark it delivered.
-        Subsequent polls will return an empty message so the agent stops repeating.
+    Check status of a previously started job.
+    - If pending: returns {status:'pending', message:'Still working… (Xs)', next_poll_after_ms:2000}
+    - If done:    returns {status:'done',    message:'<final text>', done:true, next_poll_after_ms:0}
+    - If error:   returns {status:'error',   message:'<error text>', done:true, next_poll_after_ms:0}
     """
     job = JOBS.get(cid)
     if not job:
-        return {"cid": cid, "status": "error", "message": "Unknown job ID.", "next_poll_after_ms": 2000}
+        return {"cid": cid, "status": "error", "message": "Unknown job ID.", "done": True, "next_poll_after_ms": 0}
 
-    # Optional local wait (disabled by default)
-    if max_wait_secs and job["status"] == "pending":
-        deadline = time.time() + max_wait_secs
-        while time.time() < deadline and job["status"] == "pending":
-            time.sleep(0.25)
-
-    # Finished path
-    if job["status"] in ("done", "error"):
-        if not job.get("delivered"):
-            job["delivered"] = True
-            # speak once, then go silent on subsequent polls
-            return {
-                "cid": cid,
-                "status": job["status"],
-                "message": job["message"] or "Done.",
-                "done": True,
-                "next_poll_after_ms": 0
-            }
-        else:
-            # Already delivered final result → say nothing further
-            return {
-                "cid": cid,
-                "status": job["status"],
-                "message": "",
-                "done": True,
-                "next_poll_after_ms": 0
-            }
-
-    # Pending path
-    now = time.time()
-    elapsed = int(now - job["started"])
-    since_spoken = now - (job.get("last_spoken") or 0.0)
-
-    if since_spoken >= speak_progress_every_secs:
-        job["last_spoken"] = now
+    if job["status"] == "pending":
+        elapsed = int(time.time() - job["started"])
+        # Only suggest speaking every ~6s; otherwise keep it silent but continue polling.
+        speak = (elapsed % 6 == 0)
         return {
             "cid": cid,
             "status": "pending",
-            "message": f"Still working… ({elapsed}s elapsed)",
+            "message": f"Still working… ({elapsed}s)" if speak else "",
             "done": False,
             "next_poll_after_ms": 2000
         }
-    else:
-        # Silent poll – keeps Xiaozhi alive, no spoken output
-        return {
-            "cid": cid,
-            "status": "pending",
-            "message": "",
-            "done": False,
-            "next_poll_after_ms": 2000
-        }
+
+    # done or error
+    return {
+        "cid": cid,
+        "status": job["status"],
+        "message": job["message"] or "Done.",
+        "done": True,
+        "next_poll_after_ms": 0
+    }
 
 @mcp.tool()
 def ping() -> str:
     """Health check."""
     return "pong"
 
-# ---------- run ----------
+# ---- run ----
 if __name__ == "__main__":
     mcp.run(transport="stdio")
